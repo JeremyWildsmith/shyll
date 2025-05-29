@@ -1,0 +1,5 @@
+#pragma once
+
+#include <stddef.h>
+
+static const char CNC_DAEMON_BASH_INIT[] = "@PROCESSED_DATA@";
