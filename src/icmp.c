@@ -64,14 +64,14 @@ static ssize_t receieve_ip(const int s, char* result, const int result_sz) {
     return read_bytes;
 }
 
-static unsigned short sum_icmp(const char* payload, const unsigned int sz_bytes) {
+static unsigned int sum_icmp(const char* payload, const unsigned int sz_bytes) {
     unsigned int sum = 0;
 
     for(unsigned int i = 0; i < sz_bytes / 2; i++)
-        sum += ((unsigned short*)payload)[i];
+        sum += ntohs(((unsigned short*)payload)[i]);
 
     if(sz_bytes % 2 == 1)
-        sum += payload[sz_bytes - 1];
+        sum += ((unsigned char)payload[sz_bytes - 1]) << 8;
 
     return sum;
 }
@@ -79,8 +79,8 @@ static unsigned short sum_icmp(const char* payload, const unsigned int sz_bytes)
 static unsigned short checksum_icmp(const char* payload, const unsigned int sz_bytes) {
     unsigned int sum = sum_icmp(payload, sz_bytes);
 
-    sum = (sum >> 16) + (sum & 0xFFFF);
-    sum += (sum >> 16);
+    while (sum >> 16)
+        sum = (sum >> 16) + (sum & 0xFFFF);
 
     return ~sum;
 }
@@ -98,14 +98,13 @@ static unsigned int compile_icmp(const struct icmp_message* message, char* dest,
 
     hdr->type = ICMP_ECHO;
     hdr->code = 0;
-    hdr->un.echo.id = message->id;
-    hdr->un.echo.sequence = message->sequence;
+    hdr->un.echo.id = htons(message->id);
+    hdr->un.echo.sequence = htons(message->sequence);
     hdr->checksum = 0;
 
     const unsigned short checksum = checksum_icmp(dest, required_size);
 
-    hdr->checksum = checksum;
-    //printf("chksm(%d): %d\n", required_size, checksum);
+    hdr->checksum = htons(checksum);
 
     return required_size;
 }
@@ -115,7 +114,7 @@ unsigned short compute_checksum(const struct icmp_message* message) {
 
     compile_icmp(message, b, sizeof(b));
 
-    return ((struct icmphdr*)b)->checksum;
+    return ntohs(((struct icmphdr*)b)->checksum);
 }
 
 uint16_t icmp_compute_checksum_delta(const struct icmp_message* message, const unsigned short target_checksum) {
@@ -135,13 +134,16 @@ uint16_t icmp_compute_checksum_delta(const struct icmp_message* message, const u
 
     hdr->type = ICMP_ECHO;
     hdr->code = 0;
-    hdr->un.echo.id = message->id;
-    hdr->un.echo.sequence = message->sequence;
+    hdr->un.echo.id = htons(message->id);
+    hdr->un.echo.sequence = htons(message->sequence);
 
-    const uint16_t current_sum = sum_icmp(dest, required_size);
+    const unsigned int current_sum = sum_icmp(dest, required_size);
 
-    uint16_t trail = (~target_checksum - current_sum) & 0xFFFF;
+    unsigned int trail = (~target_checksum - current_sum);
+    while (trail >> 16)
+        trail = (trail >> 16) + (trail & 0xFFFF);
 
+    trail = ntohs(trail);
     free(dest);
 
     return trail;
@@ -242,7 +244,17 @@ int receive_icmp(struct icmp_session_context* ctx, const process_icmp handler, c
         char ip_buffer[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &iphdr->saddr, ip_buffer, sizeof(ip_buffer));
 
-        handler(ctx, ip_buffer, hdr->un.echo.sequence, hdr->un.echo.id, hdr->checksum, is_reply, iphdr->ttl, payload, payload_sz);
+        handler(
+            ctx,
+            ip_buffer,
+            ntohs(hdr->un.echo.sequence),
+            ntohs(hdr->un.echo.id),
+            ntohs(hdr->checksum),
+            is_reply,
+            iphdr->ttl,
+            payload,
+            payload_sz
+        );
     }
     pthread_mutex_unlock(ctx->queue_mutex);
 
